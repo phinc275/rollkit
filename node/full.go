@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
 	ds "github.com/ipfs/go-datastore"
 	ktds "github.com/ipfs/go-datastore/keytransform"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -18,6 +17,7 @@ import (
 	"github.com/tendermint/tendermint/libs/log"
 	"github.com/tendermint/tendermint/libs/service"
 	corep2p "github.com/tendermint/tendermint/p2p"
+	"github.com/tendermint/tendermint/proxy"
 	tmtypes "github.com/tendermint/tendermint/types"
 
 	"github.com/rollkit/rollkit/block"
@@ -25,7 +25,7 @@ import (
 	"github.com/rollkit/rollkit/da"
 	"github.com/rollkit/rollkit/da/registry"
 	"github.com/rollkit/rollkit/mempool"
-	mempoolv1 "github.com/rollkit/rollkit/mempool/v1"
+	mempoolv0 "github.com/rollkit/rollkit/mempool/v0"
 	"github.com/rollkit/rollkit/p2p"
 	"github.com/rollkit/rollkit/state/indexer"
 	blockidxkv "github.com/rollkit/rollkit/state/indexer/block/kv"
@@ -90,7 +90,7 @@ func newFullNode(
 	conf config.NodeConfig,
 	p2pKey crypto.PrivKey,
 	signingKey crypto.PrivKey,
-	appClient abciclient.Client,
+	clientCreator proxy.ClientCreator,
 	genesis *tmtypes.GenesisDoc,
 	logger log.Logger,
 ) (*FullNode, error) {
@@ -136,10 +136,21 @@ func newFullNode(
 		return nil, err
 	}
 
-	mp := mempoolv1.NewTxMempool(logger, llcfg.DefaultMempoolConfig(), appClient, 0)
+	appClient, err := clientCreator.NewABCIClient()
+	if err != nil {
+		return nil, err
+	}
+
+	// Create the proxyApp and establish connections to the ABCI app (consensus, mempool, query).
+	proxyApp, err := createAndStartProxyAppConns(clientCreator, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	mp := mempoolv0.NewCListMempool(logger, llcfg.DefaultMempoolConfig(), proxyApp.Mempool(), 0)
 	mpIDs := newMempoolIDs()
 
-	blockManager, err := block.NewManager(signingKey, conf.BlockManagerConfig, genesis, s, mp, appClient, dalc, eventBus, logger.With("module", "BlockManager"))
+	blockManager, err := block.NewManager(signingKey, conf.BlockManagerConfig, genesis, s, mp, proxyApp.Consensus(), dalc, eventBus, logger.With("module", "BlockManager"))
 	if err != nil {
 		return nil, fmt.Errorf("BlockManager initialization error: %w", err)
 	}
@@ -432,4 +443,13 @@ func createAndStartIndexerService(
 	}
 
 	return indexerService, txIndexer, blockIndexer, nil
+}
+
+func createAndStartProxyAppConns(clientCreator proxy.ClientCreator, logger log.Logger) (proxy.AppConns, error) {
+	proxyApp := proxy.NewAppConns(clientCreator)
+	proxyApp.SetLogger(logger.With("module", "proxy"))
+	if err := proxyApp.Start(); err != nil {
+		return nil, fmt.Errorf("error starting proxy app connections: %v", err)
+	}
+	return proxyApp, nil
 }
